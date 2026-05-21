@@ -1,0 +1,181 @@
+services:
+  kafka:
+    container_name: kafka
+    image: "apache/kafka:latest"
+    environment:
+      - KAFKA_PROCESS_ROLES=broker,controller
+      - KAFKA_NODE_ID=0
+      - KAFKA_LISTENERS=PLAINTEXT://:9092,EXTERNAL://:9094,CONTROLLER://:9093
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=0@kafka:9093
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_NUM_PARTITIONS=6
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+      - KAFKA_HEAP_OPTS=-Xms256m -Xmx512m
+      - KAFKA_JVM_PERFORMANCE_OPTS=-XX:MaxRAMPercentage=60
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    ports:
+      - 127.0.0.1:9092:9092
+      - 127.0.0.1:9094:9094
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: "1.0"
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on: [kafka]
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=tp5-fraud
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+      - JAVA_TOOL_OPTIONS=-Xms64m -Xmx192m
+
+  transaction-generator:
+    build:
+      context: ./tp5/generator
+    container_name: transaction-generator
+    depends_on: [kafka]
+    restart: unless-stopped
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=bank-transactions
+      - N_CLIENTS=5000
+      - M_EXTERNAL=10000
+      - PEAK_MULTIPLIER=10
+      - FRAUD_RATE=0.0005
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+
+  spark-master:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    image: sidi-spark:3.5.3-py311
+    container_name: spark-master
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    ports:
+      - "127.0.0.1:7077:7077"
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - ./spark:/opt/spark/conf
+      - ./data/tp5:/workspace/data/tp5
+      - ./checkpoints/tp5:/workspace/checkpoints/tp5
+      - ./tp5/processor:/workspace/tp5/processor
+    environment:
+      - SPARK_DAEMON_MEMORY=512m
+      - PYSPARK_PYTHON=/usr/bin/python3.11
+
+  spark-worker-1: &spark-worker
+    container_name: spark-worker-1
+    image: sidi-spark:3.5.3-py311
+    depends_on: [spark-master]
+    ports:
+      - "127.0.0.1:8082:8081"
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --webui-port
+      - "8081"
+    volumes:
+      - ./data/tp5:/workspace/data/tp5
+      - ./checkpoints/tp5:/workspace/checkpoints/tp5
+    environment:
+      - SPARK_DAEMON_MEMORY=1024m
+      - PYSPARK_PYTHON=/usr/bin/python3.11
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+  spark-worker-2:
+    <<: *spark-worker
+    container_name: spark-worker-2
+    ports:
+      - "127.0.0.1:8083:8081"
+
+  spark-worker-3:
+    <<: *spark-worker
+    container_name: spark-worker-3
+    ports:
+      - "127.0.0.1:8084:8081"
+
+  spark-processor:
+    image: sidi-spark:3.5.3-py311
+    container_name: spark-processor
+    depends_on:
+      - spark-master
+      - spark-worker-1
+      - spark-worker-2
+      - spark-worker-3
+      - kafka
+    restart: unless-stopped
+    volumes:
+      - ./data/tp5:/workspace/data/tp5
+      - ./checkpoints/tp5:/workspace/checkpoints/tp5
+      - ./tp5/processor:/workspace/tp5/processor
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=bank-transactions
+      - CHECKPOINT_BASE=/workspace/checkpoints/tp5
+      - OUTPUT_BASE=/workspace/data/tp5/output
+      - PYSPARK_PYTHON=/usr/bin/python3.11
+    command:
+      - bash
+      - -lc
+      - >
+        /opt/spark/bin/spark-submit
+        --master spark://spark-master:7077
+        --deploy-mode client
+        --conf spark.executor.memory=1g
+        --conf spark.driver.memory=1g
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3,org.apache.kafka:kafka-clients:3.5.1
+        /workspace/tp5/processor/fraud_stream_processor.py
+    deploy:
+      resources:
+        limits:
+          memory: 2048M
+
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jupyter
+    depends_on: [spark-master, kafka, spark-processor]
+    ports:
+      - "127.0.0.1:8888:8888"
+      - "127.0.0.1:4040:4040"
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - JUPYTER_TOKEN=ChangeMeStrong
+      - SPARK_MASTER=spark://spark-master:7077
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - PYSPARK_SUBMIT_ARGS=--conf spark.pyspark.python=/usr/bin/python3.11 --conf spark.pyspark.driver.python=/opt/conda/bin/python --conf spark.driver.memory=1024m --conf spark.executor.memory=1024m --conf spark.sql.shuffle.partitions=8 --master spark://spark-master:7077 --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3,org.apache.kafka:kafka-clients:3.5.1 pyspark-shell
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./data/tp5:/workspace/data/tp5
+      - ./checkpoints/tp5:/workspace/checkpoints/tp5
+      - ./tp5:/home/jovyan/work/tp5
+
+volumes:
+  kafka_data:
